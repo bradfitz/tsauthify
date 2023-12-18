@@ -232,19 +232,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.rp.ServeHTTP(w, r)
 
 	if p.backendType == backendTypeTrippLite && r.Method == "GET" && r.URL.Path == "/" {
+		username := "localadmin" // TODO: be configurable
 		b := rec.Body.Bytes()
 		b = bytes.ReplaceAll(b, []byte(`</html>`), []byte(`<script defer>
 	window.onload = function() {
-		alert('loaded');
-		document.getElementsByTagName("input")[0].value = "localadmin";
+			console.log("tsauthify loaded; auto-filling form...");
+		document.getElementsByTagName("input")[0].value = "`+username+`";
 		document.getElementsByTagName("input")[0].dispatchEvent(new KeyboardEvent('compositionend'), {});
 		document.getElementsByTagName("input")[1].value = "dummy-password";
 		document.getElementsByTagName("input")[1].dispatchEvent(new KeyboardEvent('compositionend'), {});
-		alert('gonna click');
 		window.setTimeout(function() {
-			console.log("clicking...");
+			console.log("tsauthify: clicking button");
 			document.getElementsByTagName("button")[1].click()
-			console.log("clicked");
+			console.log("tsauthify: clicked");
 		}, 200);
 	};
 </script></html>`))
