@@ -10,20 +10,51 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"tailscale.com/tsnet"
 )
 
+var (
+	flagType    = flag.String("type", "", "backend type. One of: unifi, tripplite-webcardlxe, supermicro-bmc")
+	flagBackend = flag.String("backend", "", "backend URL root")
+)
+
 func main() {
+	flag.Parse()
+
+	switch *flagType {
+	case "":
+		log.Fatal("--type is required")
+	default:
+		log.Fatalf("unknown --type %q", *flagType)
+	case "unifi", "tripplite-webcardlxe", "supermicro-bmc":
+		// good.
+	}
+	if *flagBackend == "" {
+		log.Fatal("--backend is required")
+	}
+	base, err := url.Parse(*flagBackend)
+	if err != nil {
+		log.Fatalf("invalid --backend value %q: %v", *flagBackend, err)
+	}
+	if base.Path != "" && base.Path != "/" {
+		base.Path = ""
+	}
+
 	log.Printf("Starting tsauthify...")
 	os.Setenv("TAILSCALE_USE_WIP_CODE", "1")
 	ctx := context.Background()
@@ -31,7 +62,7 @@ func main() {
 	ts := &tsnet.Server{
 		Hostname: "authify",
 	}
-	_, err := ts.Up(ctx)
+	_, err = ts.Up(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -44,10 +75,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	base, err := url.Parse("https://10.0.0.10:8443")
-	if err != nil {
-		panic(err)
-	}
 	tlsConfig := &tls.Config{InsecureSkipVerify: true}
 	dialer := &net.Dialer{
 		Timeout:   5 * time.Second,
@@ -67,7 +94,7 @@ func main() {
 
 	p := &Proxy{
 		backend:     base,
-		backendType: backendTypeUnifi,
+		backendType: backendType(*flagType),
 		rp:          rp,
 	}
 
@@ -92,7 +119,19 @@ type Proxy struct {
 	validUntil time.Time
 }
 
+func (p *Proxy) noCookies() bool {
+	switch p.backendType {
+	default:
+		return false
+	case backendTypeTrippLite:
+		return true
+	}
+}
+
 func (p *Proxy) getCookies() (_ []*http.Cookie, refreshed bool, _ error) {
+	if p.noCookies() {
+		return nil, false, nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -164,5 +203,55 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cookies {
 		r.AddCookie(c)
 	}
+
+	var rec *httptest.ResponseRecorder
+	origW := w
+
+	if p.backendType == backendTypeTrippLite {
+		if r.Method == "POST" && r.URL.Path == "/api/oauth/token" && r.URL.Query().Get("grant_type") == "password" {
+			pass, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), "keys", "tsauthify", "tripplite-webcardlxe"))
+			if err != nil {
+				log.Printf("Error reading tripplite-webcardlxe key: %v", err)
+				http.Error(w, "Error reading key", http.StatusInternalServerError)
+				return
+			}
+			j, _ := json.Marshal(map[string]string{
+				"username": "localadmin",
+				"password": strings.TrimSpace(string(pass)),
+			})
+			r.ContentLength = int64(len(j))
+			r.Body = io.NopCloser(bytes.NewReader(j))
+		}
+
+		if r.Method == "GET" && r.URL.Path == "/" {
+			rec = httptest.NewRecorder()
+			w = rec
+		}
+	}
+
 	p.rp.ServeHTTP(w, r)
+
+	if p.backendType == backendTypeTrippLite && r.Method == "GET" && r.URL.Path == "/" {
+		b := rec.Body.Bytes()
+		b = bytes.ReplaceAll(b, []byte(`</html>`), []byte(`<script defer>
+	window.onload = function() {
+		alert('loaded');
+		document.getElementsByTagName("input")[0].value = "localadmin";
+		document.getElementsByTagName("input")[0].dispatchEvent(new KeyboardEvent('compositionend'), {});
+		document.getElementsByTagName("input")[1].value = "dummy-password";
+		document.getElementsByTagName("input")[1].dispatchEvent(new KeyboardEvent('compositionend'), {});
+		alert('gonna click');
+		window.setTimeout(function() {
+			console.log("clicking...");
+			document.getElementsByTagName("button")[1].click()
+			console.log("clicked");
+		}, 200);
+	};
+</script></html>`))
+		w = origW
+		w.Header().Set("Content-Length", fmt.Sprint(len(b)))
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		w.Write(b)
+	}
 }
