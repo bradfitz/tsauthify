@@ -92,22 +92,22 @@ type Proxy struct {
 	validUntil time.Time
 }
 
-func (p *Proxy) getCookies() ([]*http.Cookie, error) {
+func (p *Proxy) getCookies() (_ []*http.Cookie, refreshed bool, _ error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	now := time.Now()
 	if now.Before(p.validUntil) {
-		return p.cookies, nil
+		return p.cookies, false, nil
 	}
 
 	cookies, err := p.renewCookiesLocked()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	p.cookies = cookies
 	p.validUntil = now.Add(10 * time.Minute)
-	return cookies, nil
+	return cookies, true, nil
 }
 
 func (p *Proxy) renewCookiesLocked() ([]*http.Cookie, error) {
@@ -149,13 +149,18 @@ func (p *Proxy) renewCookiesLocked() ([]*http.Cookie, error) {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	cookies, err := p.getCookies()
+	cookies, cookiesRefreshed, err := p.getCookies()
 	if err != nil {
 		log.Printf("Error getting cookies: %v", err)
 		http.Error(w, "Error getting cookies", http.StatusInternalServerError)
 		return
 	}
 
+	if cookiesRefreshed {
+		for _, c := range cookies {
+			http.SetCookie(w, c)
+		}
+	}
 	for _, c := range cookies {
 		r.AddCookie(c)
 	}
