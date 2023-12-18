@@ -1,6 +1,8 @@
 // The tsauthify command is an HTTP reverse proxy that maps Tailscale
-// authentication cookies to backend-specific HTTP username & password
-// cookie-based authentication.
+// authentication to backend-specific HTTP username & password
+// cookie-based authentication. Its goal is to enable Tailscale-based
+// auth without usernames and passwords to everything running in
+// Brad's homelab. And other people's.
 //
 // As of 2023-12-16 it is a work in progress.
 package main
