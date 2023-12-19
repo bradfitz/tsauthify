@@ -84,14 +84,31 @@ func main() {
 		DualStack: true,
 	}
 	dialContext := dialer.DialContext
-	rp := httputil.NewSingleHostReverseProxy(base)
-	rp.Transport = &http.Transport{
-		TLSClientConfig:       tlsConfig,
-		DialContext:           dialContext,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+	rp := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.URL.Scheme = base.Scheme
+			pr.Out.URL.Host = base.Host
+
+			// SuperMicro's BMC treats "Websocket" and "WebSocket"
+			// case sensitively, in violation of the HTTP specs.
+			// Adjust to pacify it.
+			outh := pr.Out.Header
+			for h, vv := range outh {
+				h2 := strings.ReplaceAll(h, "Websocket", "WebSocket")
+				if h2 != h {
+					outh[h2] = vv
+					delete(outh, h)
+				}
+			}
+		},
+		Transport: &http.Transport{
+			TLSClientConfig:       tlsConfig,
+			DialContext:           dialContext,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
 	}
 
 	p := &Proxy{
@@ -125,7 +142,7 @@ func (p *Proxy) noCookies() bool {
 	switch p.backendType {
 	default:
 		return false
-	case backendTypeTrippLite:
+	case backendTypeTrippLite, backendTypeSupermicroBMC:
 		return true
 	}
 }
@@ -190,6 +207,7 @@ func (p *Proxy) renewCookiesLocked() ([]*http.Cookie, error) {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Printf("%v %v ... ", r.Method, r.URL.Path)
 	cookies, cookiesRefreshed, err := p.getCookies()
 	if err != nil {
 		log.Printf("Error getting cookies: %v", err)
@@ -211,7 +229,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if p.backendType == backendTypeTrippLite {
 		if r.Method == "POST" && r.URL.Path == "/api/oauth/token" && r.URL.Query().Get("grant_type") == "password" {
-			pass, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), "keys", "tsauthify", "tripplite-webcardlxe"))
+			pass, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), "keys", "tsauthify", string(p.backendType)))
 			if err != nil {
 				log.Printf("Error reading tripplite-webcardlxe key: %v", err)
 				http.Error(w, "Error reading key", http.StatusInternalServerError)
@@ -229,6 +247,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			rec = httptest.NewRecorder()
 			w = rec
 		}
+	}
+	if p.backendType == backendTypeSupermicroBMC && r.Method == "POST" && r.URL.Path == "/cgi/login.cgi" {
+		pass, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), "keys", "tsauthify", string(p.backendType)))
+		if err != nil {
+			log.Printf("Error reading tripplite-webcardlxe key: %v", err)
+			http.Error(w, "Error reading key", http.StatusInternalServerError)
+			return
+		}
+		uv := (url.Values{
+			"name": []string{"ADMIN"},
+			"pwd":  []string{strings.TrimSpace(string(pass))},
+		}).Encode()
+		r.ContentLength = int64(len(uv))
+		r.Body = io.NopCloser(strings.NewReader(uv))
 	}
 
 	p.rp.ServeHTTP(w, r)
