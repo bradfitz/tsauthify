@@ -8,21 +8,17 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"flag"
-	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -30,21 +26,23 @@ import (
 	"tailscale.com/tsnet"
 )
 
-var (
-	flagType    = flag.String("type", "", "backend type. One of: unifi, tripplite-webcardlxe, supermicro-bmc")
-	flagBackend = flag.String("backend", "", "backend URL root")
-)
-
 func main() {
+	var typs []string
+	for typ := range backendTypes {
+		typs = append(typs, string(typ))
+	}
+	sort.Strings(typs)
+	var (
+		flagType    = flag.String("type", "", "backend type. One of: "+strings.Join(typs, ", "))
+		flagBackend = flag.String("backend", "", "backend URL root")
+	)
 	flag.Parse()
 
-	switch *flagType {
-	case "":
-		log.Fatal("--type is required")
-	default:
+	if _, ok := backendTypes[backendType(*flagType)]; !ok {
+		if *flagType == "" {
+			log.Fatal("--type is required")
+		}
 		log.Fatalf("unknown --type %q", *flagType)
-	case "unifi", "tripplite-webcardlxe", "supermicro-bmc":
-		// good.
 	}
 	if *flagBackend == "" {
 		log.Fatal("--backend is required")
@@ -53,7 +51,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid --backend value %q: %v", *flagBackend, err)
 	}
-	if base.Path != "" && base.Path != "/" {
+	if base.Path == "/" {
 		base.Path = ""
 	}
 
@@ -84,6 +82,8 @@ func main() {
 		DualStack: true,
 	}
 	dialContext := dialer.DialContext
+	impl := backendTypes[backendType(*flagType)]
+	var p *Proxy // closed over by ModifyResponse but p is set later
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = base.Scheme
@@ -101,6 +101,12 @@ func main() {
 				}
 			}
 		},
+		ModifyResponse: func(res *http.Response) error {
+			if impl.modifyResponse == nil {
+				return nil
+			}
+			return impl.modifyResponse(p, res)
+		},
 		Transport: &http.Transport{
 			TLSClientConfig:       tlsConfig,
 			DialContext:           dialContext,
@@ -111,10 +117,10 @@ func main() {
 		},
 	}
 
-	p := &Proxy{
-		backend:     base,
-		backendType: backendType(*flagType),
-		rp:          rp,
+	p = &Proxy{
+		backend: base,
+		impl:    impl,
+		rp:      rp,
 	}
 
 	log.Fatal(http.Serve(ln, p))
@@ -122,33 +128,54 @@ func main() {
 
 type backendType string
 
-const (
-	backendTypeUnifi         backendType = "unifi"
-	backendTypeTrippLite     backendType = "tripplite-webcardlxe"
-	backendTypeSupermicroBMC backendType = "supermicro-bmc"
-)
+var backendTypes = map[backendType]*backendImpl{}
+
+type backendImpl struct {
+	Type backendType // optional; populated by addBackend
+
+	// getCookiesLocked optionally specifies a func to get auth cookies
+	// to send to the backend.
+	getCookiesLocked func(*Proxy, context.Context) ([]*http.Cookie, error)
+
+	modifyResponse func(*Proxy, *http.Response) error // optional
+	modifyRequest  func(*Proxy, *http.Request) error  // optional
+}
+
+func addBackend(typ backendType, impl *backendImpl) {
+	if _, dup := backendTypes[typ]; dup {
+		panic("duplicate backend type: " + typ)
+	}
+	if typ == "" {
+		panic("empty type")
+	}
+	if impl.Type != "" && impl.Type != typ {
+		panic("inconsistent backend type")
+	}
+	impl.Type = typ
+	backendTypes[typ] = impl
+}
 
 type Proxy struct {
-	backendType backendType
-	backend     *url.URL
-	rp          *httputil.ReverseProxy
+	impl    *backendImpl
+	backend *url.URL
+	rp      *httputil.ReverseProxy
 
 	mu         sync.Mutex
 	cookies    []*http.Cookie
 	validUntil time.Time
 }
 
-func (p *Proxy) noCookies() bool {
-	switch p.backendType {
-	default:
-		return false
-	case backendTypeTrippLite, backendTypeSupermicroBMC:
-		return true
+func (p *Proxy) getPassword() (string, error) {
+	v, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), "keys", "tsauthify", string(p.impl.Type)))
+	if err != nil {
+		return "", err
 	}
+	return strings.TrimSpace(string(v)), nil
 }
 
 func (p *Proxy) getCookies() (_ []*http.Cookie, refreshed bool, _ error) {
-	if p.noCookies() {
+	f := p.impl.getCookiesLocked
+	if f == nil {
 		return nil, false, nil
 	}
 	p.mu.Lock()
@@ -159,51 +186,16 @@ func (p *Proxy) getCookies() (_ []*http.Cookie, refreshed bool, _ error) {
 		return p.cookies, false, nil
 	}
 
-	cookies, err := p.renewCookiesLocked()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cookies, err := f(p, ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	p.cookies = cookies
 	p.validUntil = now.Add(10 * time.Minute)
 	return cookies, true, nil
-}
-
-func (p *Proxy) renewCookiesLocked() ([]*http.Cookie, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	switch p.backendType {
-	default:
-		return nil, fmt.Errorf("unknown backend type: %v", p.backendType)
-	case backendTypeUnifi:
-		jbody, err := json.Marshal(map[string]any{
-			"username": "readonly",
-			"password": "readonly123", // TODO: get from file or setec
-			"remember": false,
-			"strict":   true,
-		})
-		if err != nil {
-			return nil, err
-		}
-		req, err := http.NewRequestWithContext(ctx, "POST", p.backend.String()+"/api/login", bytes.NewReader(jbody))
-		if err != nil {
-			return nil, err
-		}
-		res, err := p.rp.Transport.RoundTrip(req)
-		if err != nil {
-			return nil, err
-		}
-		defer res.Body.Close()
-		if res.StatusCode != 200 {
-			res.Write(os.Stderr)
-			return nil, fmt.Errorf("non-200 getting cookies: %v", res.Status)
-		}
-		cookies := res.Cookies()
-		if len(cookies) == 0 {
-			return nil, fmt.Errorf("no cookies found")
-		}
-		return cookies, nil
-	}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -224,68 +216,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.AddCookie(c)
 	}
 
-	var rec *httptest.ResponseRecorder
-	origW := w
-
-	if p.backendType == backendTypeTrippLite {
-		if r.Method == "POST" && r.URL.Path == "/api/oauth/token" && r.URL.Query().Get("grant_type") == "password" {
-			pass, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), "keys", "tsauthify", string(p.backendType)))
-			if err != nil {
-				log.Printf("Error reading tripplite-webcardlxe key: %v", err)
-				http.Error(w, "Error reading key", http.StatusInternalServerError)
-				return
-			}
-			j, _ := json.Marshal(map[string]string{
-				"username": "localadmin",
-				"password": strings.TrimSpace(string(pass)),
-			})
-			r.ContentLength = int64(len(j))
-			r.Body = io.NopCloser(bytes.NewReader(j))
-		}
-
-		if r.Method == "GET" && r.URL.Path == "/" {
-			rec = httptest.NewRecorder()
-			w = rec
-		}
-	}
-	if p.backendType == backendTypeSupermicroBMC && r.Method == "POST" && r.URL.Path == "/cgi/login.cgi" {
-		pass, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), "keys", "tsauthify", string(p.backendType)))
-		if err != nil {
-			log.Printf("Error reading tripplite-webcardlxe key: %v", err)
-			http.Error(w, "Error reading key", http.StatusInternalServerError)
+	if f := p.impl.modifyRequest; f != nil {
+		if err := f(p, r); err != nil {
+			log.Printf("Error altering request: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		uv := (url.Values{
-			"name": []string{"ADMIN"},
-			"pwd":  []string{strings.TrimSpace(string(pass))},
-		}).Encode()
-		r.ContentLength = int64(len(uv))
-		r.Body = io.NopCloser(strings.NewReader(uv))
 	}
 
 	p.rp.ServeHTTP(w, r)
-
-	if p.backendType == backendTypeTrippLite && r.Method == "GET" && r.URL.Path == "/" {
-		username := "localadmin" // TODO: be configurable
-		b := rec.Body.Bytes()
-		b = bytes.ReplaceAll(b, []byte(`</html>`), []byte(`<script defer>
-	window.onload = function() {
-			console.log("tsauthify loaded; auto-filling form...");
-		document.getElementsByTagName("input")[0].value = "`+username+`";
-		document.getElementsByTagName("input")[0].dispatchEvent(new KeyboardEvent('compositionend'), {});
-		document.getElementsByTagName("input")[1].value = "dummy-password";
-		document.getElementsByTagName("input")[1].dispatchEvent(new KeyboardEvent('compositionend'), {});
-		window.setTimeout(function() {
-			console.log("tsauthify: clicking button");
-			document.getElementsByTagName("button")[1].click()
-			console.log("tsauthify: clicked");
-		}, 200);
-	};
-</script></html>`))
-		w = origW
-		w.Header().Set("Content-Length", fmt.Sprint(len(b)))
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusOK)
-		w.Write(b)
-	}
 }
