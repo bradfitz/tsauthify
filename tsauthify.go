@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"log"
 	"net"
@@ -23,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 )
 
@@ -35,6 +37,7 @@ func main() {
 	var (
 		flagType    = flag.String("type", "", "backend type. One of: "+strings.Join(typs, ", "))
 		flagBackend = flag.String("backend", "", "backend URL root")
+		flagName    = flag.String("name", "", "tsnet hostname and state-directory suffix. Defaults to --type. State is stored in $XDG_CONFIG_HOME/tsauthify-<name>.")
 	)
 	flag.Parse()
 
@@ -55,18 +58,28 @@ func main() {
 		base.Path = ""
 	}
 
+	name := *flagName
+	if name == "" {
+		name = *flagType
+	}
+
 	log.Printf("Starting tsauthify...")
 	os.Setenv("TAILSCALE_USE_WIP_CODE", "1")
 	ctx := context.Background()
 
+	confDir, err := os.UserConfigDir()
+	if err != nil {
+		log.Fatalf("UserConfigDir: %v", err)
+	}
 	ts := &tsnet.Server{
-		Hostname: "authify",
+		Hostname: name,
+		Dir:      filepath.Join(confDir, "tsauthify-"+name),
 	}
 	_, err = ts.Up(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
-	_, err = ts.LocalClient()
+	lc, err := ts.LocalClient()
 	if err != nil {
 		log.Fatalf("getting local client: %v", err)
 	}
@@ -118,9 +131,10 @@ func main() {
 	}
 
 	p = &Proxy{
-		backend: base,
-		impl:    impl,
-		rp:      rp,
+		backend:     base,
+		impl:        impl,
+		rp:          rp,
+		localClient: lc,
 	}
 
 	log.Fatal(http.Serve(ln, p))
@@ -134,8 +148,11 @@ type backendImpl struct {
 	Type backendType // optional; populated by addBackend
 
 	// getCookiesLocked optionally specifies a func to get auth cookies
-	// to send to the backend.
-	getCookiesLocked func(*Proxy, context.Context) ([]*http.Cookie, error)
+	// to send to the backend. It receives the inbound request so it can
+	// resolve the caller's identity via Proxy.backendCreds. The cookies it
+	// returns are shared across all callers, so this only fits backends
+	// where all Tailscale users share a single backend account.
+	getCookiesLocked func(*Proxy, context.Context, *http.Request) ([]*http.Cookie, error)
 
 	modifyResponse func(*Proxy, *http.Response) error // optional
 	modifyRequest  func(*Proxy, *http.Request) error  // optional
@@ -156,24 +173,45 @@ func addBackend(typ backendType, impl *backendImpl) {
 }
 
 type Proxy struct {
-	impl    *backendImpl
-	backend *url.URL
-	rp      *httputil.ReverseProxy
+	impl        *backendImpl
+	backend     *url.URL
+	rp          *httputil.ReverseProxy
+	localClient *local.Client
 
 	mu         sync.Mutex
 	cookies    []*http.Cookie
 	validUntil time.Time
 }
 
-func (p *Proxy) getPassword() (string, error) {
-	v, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), "keys", "tsauthify", string(p.impl.Type)))
+// passwordFor returns the password stored on disk for the given backend user.
+// Passwords live at $HOME/keys/tsauthify/<type>/<username>.
+func (p *Proxy) passwordFor(username string) (string, error) {
+	if username == "" {
+		return "", errors.New("empty backend username")
+	}
+	path := filepath.Join(os.Getenv("HOME"), "keys", "tsauthify", string(p.impl.Type), username)
+	v, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(v)), nil
 }
 
-func (p *Proxy) getCookies() (_ []*http.Cookie, refreshed bool, _ error) {
+// backendCreds returns the (username, password) that the proxy should present
+// to the upstream backend on behalf of the caller of r.
+func (p *Proxy) backendCreds(r *http.Request) (username, password string, err error) {
+	username, err = p.resolveBackendUsername(r)
+	if err != nil {
+		return "", "", err
+	}
+	password, err = p.passwordFor(username)
+	if err != nil {
+		return "", "", err
+	}
+	return username, password, nil
+}
+
+func (p *Proxy) getCookies(r *http.Request) (_ []*http.Cookie, refreshed bool, _ error) {
 	f := p.impl.getCookiesLocked
 	if f == nil {
 		return nil, false, nil
@@ -186,10 +224,10 @@ func (p *Proxy) getCookies() (_ []*http.Cookie, refreshed bool, _ error) {
 		return p.cookies, false, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	cookies, err := f(p, ctx)
+	cookies, err := f(p, ctx, r)
 	if err != nil {
 		return nil, false, err
 	}
@@ -200,7 +238,7 @@ func (p *Proxy) getCookies() (_ []*http.Cookie, refreshed bool, _ error) {
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("%v %v ... ", r.Method, r.URL.Path)
-	cookies, cookiesRefreshed, err := p.getCookies()
+	cookies, cookiesRefreshed, err := p.getCookies(r)
 	if err != nil {
 		log.Printf("Error getting cookies: %v", err)
 		http.Error(w, "Error getting cookies", http.StatusInternalServerError)

@@ -11,10 +11,14 @@ import (
 
 func init() {
 	addBackend("unifi", &backendImpl{
-		getCookiesLocked: func(p *Proxy, ctx context.Context) ([]*http.Cookie, error) {
+		getCookiesLocked: func(p *Proxy, ctx context.Context, r *http.Request) ([]*http.Cookie, error) {
+			username, password, err := p.backendCreds(r)
+			if err != nil {
+				return nil, err
+			}
 			jbody, err := json.Marshal(map[string]any{
-				"username": "readonly",
-				"password": "readonly123", // TODO: get from file or setec
+				"username": username,
+				"password": password,
 				"remember": false,
 				"strict":   true,
 			})

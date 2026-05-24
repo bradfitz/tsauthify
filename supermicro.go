@@ -1,9 +1,7 @@
 package main
 
 import (
-	"errors"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,14 +13,13 @@ func init() {
 			if r.Method != "POST" || r.URL.Path != "/cgi/login.cgi" {
 				return nil
 			}
-			pass, err := p.getPassword()
+			username, password, err := p.backendCreds(r)
 			if err != nil {
-				log.Printf("Error reading username: %v", err)
-				return errors.New("error reading key")
+				return err
 			}
 			uv := (url.Values{
-				"name": []string{"ADMIN"},
-				"pwd":  []string{strings.TrimSpace(string(pass))},
+				"name": []string{username},
+				"pwd":  []string{password},
 			}).Encode()
 			r.ContentLength = int64(len(uv))
 			r.Body = io.NopCloser(strings.NewReader(uv))

@@ -31,7 +31,7 @@ func init() {
 				return nil
 			}
 			if r.Method == "POST" && haLoginFlowRE.MatchString(r.URL.Path) {
-				pass, err := p.getPassword()
+				username, password, err := p.backendCreds(r)
 				if err != nil {
 					return err
 				}
@@ -44,8 +44,8 @@ func init() {
 				if err := json.Unmarshal(body, &m); err != nil {
 					return err
 				}
-				m["username"] = "bradfitz" // TODO: be configurable
-				m["password"] = pass
+				m["username"] = username
+				m["password"] = password
 				body, err = json.Marshal(m)
 				if err != nil {
 					return err
