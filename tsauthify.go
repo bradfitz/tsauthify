@@ -35,9 +35,10 @@ func main() {
 	}
 	sort.Strings(typs)
 	var (
-		flagType    = flag.String("type", "", "backend type. One of: "+strings.Join(typs, ", "))
-		flagBackend = flag.String("backend", "", "backend URL root")
-		flagName    = flag.String("name", "", "tsnet hostname and state-directory suffix. Defaults to --type. State is stored in $XDG_CONFIG_HOME/tsauthify-<name>.")
+		flagType      = flag.String("type", "", "backend type. One of: "+strings.Join(typs, ", "))
+		flagBackend   = flag.String("backend", "", "backend URL root")
+		flagName      = flag.String("name", "", "tsnet hostname and state-directory suffix. Defaults to --type. State is stored in $XDG_CONFIG_HOME/tsauthify-<name>.")
+		flagPasswords = flag.String("passwords-dir", "", "directory containing per-user backend password files (one file per username, file contents = password). If unset, defaults to $HOME/keys/tsauthify/<type>/.")
 	)
 	flag.Parse()
 
@@ -131,10 +132,11 @@ func main() {
 	}
 
 	p = &Proxy{
-		backend:     base,
-		impl:        impl,
-		rp:          rp,
-		localClient: lc,
+		backend:      base,
+		impl:         impl,
+		rp:           rp,
+		localClient:  lc,
+		passwordsDir: *flagPasswords,
 	}
 
 	log.Fatal(http.Serve(ln, p))
@@ -173,10 +175,11 @@ func addBackend(typ backendType, impl *backendImpl) {
 }
 
 type Proxy struct {
-	impl        *backendImpl
-	backend     *url.URL
-	rp          *httputil.ReverseProxy
-	localClient *local.Client
+	impl         *backendImpl
+	backend      *url.URL
+	rp           *httputil.ReverseProxy
+	localClient  *local.Client
+	passwordsDir string // if non-empty, where to read passwords; see --passwords-dir
 
 	mu         sync.Mutex
 	cookies    []*http.Cookie
@@ -184,13 +187,17 @@ type Proxy struct {
 }
 
 // passwordFor returns the password stored on disk for the given backend user.
-// Passwords live at $HOME/keys/tsauthify/<type>/<username>.
+// Passwords live at <passwordsDir>/<username>, where passwordsDir defaults
+// to $HOME/keys/tsauthify/<type>/ when --passwords-dir is unset.
 func (p *Proxy) passwordFor(username string) (string, error) {
 	if username == "" {
 		return "", errors.New("empty backend username")
 	}
-	path := filepath.Join(os.Getenv("HOME"), "keys", "tsauthify", string(p.impl.Type), username)
-	v, err := os.ReadFile(path)
+	dir := p.passwordsDir
+	if dir == "" {
+		dir = filepath.Join(os.Getenv("HOME"), "keys", "tsauthify", string(p.impl.Type))
+	}
+	v, err := os.ReadFile(filepath.Join(dir, username))
 	if err != nil {
 		return "", err
 	}
