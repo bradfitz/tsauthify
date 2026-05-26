@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 )
 
 func init() {
@@ -43,6 +44,26 @@ func init() {
 				return nil, fmt.Errorf("no cookies found")
 			}
 			return cookies, nil
+		},
+		// modifyResponse watches for the backend deleting the unifises
+		// session cookie (i.e. the user clicked Sign Out) and invalidates
+		// our cached cookies so the next request triggers a fresh /api/login.
+		// Without this, after a logout we'd keep handing out stale cookies
+		// until the 10-minute cache TTL expires.
+		modifyResponse: func(p *Proxy, res *http.Response) error {
+			for _, c := range res.Cookies() {
+				if c.Name != "unifises" {
+					continue
+				}
+				if c.MaxAge < 0 || (!c.Expires.IsZero() && c.Expires.Before(time.Now())) {
+					p.mu.Lock()
+					p.cookies = nil
+					p.validUntil = time.Time{}
+					p.mu.Unlock()
+					break
+				}
+			}
+			return nil
 		},
 	})
 }
